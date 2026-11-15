@@ -388,14 +388,37 @@ class Handler(BaseHTTPRequestHandler):
         self.send(202, '{"ok":true}', 'application/json')
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        log('connection from', addr[0])
+        return sock, addr
+
+    def handle_error(self, request, client_address):
+        import traceback
+        log('ERROR on connection from', client_address[0], '\n' + traceback.format_exc())
+
+
+def self_test():
+    time.sleep(2)
+    try:
+        r = urllib.request.urlopen(f"http://127.0.0.1:{S['port']}/api/health", timeout=5)
+        log('self-test: portal answers inside the add-on (HTTP %d)' % r.status)
+    except Exception as e:
+        log('self-test FAILED inside the add-on:', repr(e))
+
+
 def main():
     log('settings:', {k: ('***' if k in ('token', 'webhook_secret') and v else v) for k, v in S.items()})
     if not S['repo']:
         log('No github_repo set. Open the add-on Configuration tab and fill it in.')
     log(f"portal starting on :{S['port']} for {S['repo'] or '(no repo)'} ({S['branch']}), polling every {S['poll']}s")
     threading.Thread(target=poller, daemon=True).start()
-    srv = ThreadingHTTPServer(('0.0.0.0', S['port']), Handler)
-    srv.daemon_threads = True
+    srv = Server(('0.0.0.0', S['port']), Handler)
+    threading.Thread(target=self_test, daemon=True).start()
     log('listening; open http://<home-assistant-ip>:%d/' % S['port'])
     srv.serve_forever()
 

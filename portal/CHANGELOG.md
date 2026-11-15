@@ -8,3 +8,6 @@
 ## 0.1.1
 - Errors are logged with details and answered with a message instead of a dropped connection.
 - Logs its settings (token hidden) at start.
+
+## 0.1.2
+- Logs every incoming connection and runs a self-test at start, to trace connection problems.
