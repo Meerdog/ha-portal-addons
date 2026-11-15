@@ -299,6 +299,20 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        try:
+            self._get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            import traceback
+            log('ERROR serving', self.path, '\n' + traceback.format_exc())
+            try:
+                self.send(500, '<p style="font-family:system-ui;padding:2em">The portal hit an error; '
+                               'the add-on log has the details.</p>')
+            except Exception:
+                pass
+
+    def _get(self):
         path = urllib.parse.urlsplit(self.path).path
         if path == '/' or path == '/index.html':
             return self.send(200, home_page(), headers={'Cache-Control': 'no-store'})
@@ -375,11 +389,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    log('settings:', {k: ('***' if k in ('token', 'webhook_secret') and v else v) for k, v in S.items()})
     if not S['repo']:
         log('No github_repo set. Open the add-on Configuration tab and fill it in.')
     log(f"portal starting on :{S['port']} for {S['repo'] or '(no repo)'} ({S['branch']}), polling every {S['poll']}s")
     threading.Thread(target=poller, daemon=True).start()
-    ThreadingHTTPServer(('0.0.0.0', S['port']), Handler).serve_forever()
+    srv = ThreadingHTTPServer(('0.0.0.0', S['port']), Handler)
+    srv.daemon_threads = True
+    log('listening; open http://<home-assistant-ip>:%d/' % S['port'])
+    srv.serve_forever()
 
 
 if __name__ == '__main__':

@@ -1,5 +1,5 @@
 name: Home Portal
-version: "0.1.0"
+version: "0.1.1"
 slug: home_portal
 description: Serves pages Claude publishes to your GitHub content repo, with versioned engines and sandboxed pages.
 url: https://github.com/Meerdog/ha-portal-addons
