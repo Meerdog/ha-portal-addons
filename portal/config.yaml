@@ -1,0 +1,32 @@
+name: Home Portal
+version: "0.1.0"
+slug: home_portal
+description: Serves pages Claude publishes to your GitHub content repo, with versioned engines and sandboxed pages.
+url: https://github.com/Meerdog/ha-portal-addons
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: application
+boot: auto
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Portal web page
+webui: "http://[HOST]:[PORT:8099]/"
+options:
+  github_repo: Meerdog/portal-content
+  github_token: ""
+  branch: main
+  poll_seconds: 30
+  portal_title: Home portal
+  public_url: ""
+  webhook_secret: ""
+schema:
+  github_repo: str
+  github_token: password
+  branch: str
+  poll_seconds: int(5,3600)
+  portal_title: str
+  public_url: str?
+  webhook_secret: password?
