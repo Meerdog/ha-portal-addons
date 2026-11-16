@@ -1,7 +1,7 @@
 name: Home Portal
-version: "0.1.2"
+version: "0.2.0"
 slug: home_portal
-description: Serves pages Claude publishes to your GitHub content repo, with versioned engines and sandboxed pages.
+description: Serves pages Claude publishes to your GitHub content repo, plus expiring share links, with versioned engines and sandboxed pages.
 url: https://github.com/Meerdog/ha-portal-addons
 arch:
   - amd64
@@ -11,8 +11,10 @@ startup: application
 boot: auto
 ports:
   8099/tcp: 8099
+  8098/tcp: null
 ports_description:
   8099/tcp: Portal web page
+  8098/tcp: Share links (for the tunnel; leave empty)
 webui: "http://[HOST]:[PORT:8099]/"
 options:
   github_repo: Meerdog/portal-content

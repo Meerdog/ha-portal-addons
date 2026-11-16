@@ -13,10 +13,17 @@ serves:
     /api/health           sync state
     /hook                 GitHub push webhook (optional; needs webhook_secret)
 
+A second listener (share_port, 8098) is for the public share host, which sits outside
+Cloudflare Access. It serves nothing from the portal, only:
+
+    /s/<token>/...        a share, until it expires (410 after)
+    /lib/<name>/<ver>/... only engine versions that a live share uses
+
 Content repo layout:
 
     pages/<slug>/index.html (+ any other files)
     lib/<name>/<version>/...
+    shares/<id>/share.json + shares/<id>/site/...
 
 Every page is served with a sandboxing Content-Security-Policy, so a page can only
 load from the portal and from the outside sites it declared in report-sites.
@@ -65,12 +72,14 @@ def load_settings():
         'title': env('portal_title', 'Home portal'),
         'data_dir': os.environ.get('PORTAL_DATA', '/data'),
         'port': int(os.environ.get('PORTAL_PORT', 8099)),
+        'share_port': int(os.environ.get('PORTAL_SHARE_PORT', 8098)),
     }
 
 
 S = load_settings()
 CONTENT = os.path.join(S['data_dir'], 'content')
-STATE = {'pages': {}, 'by_id': {}, 'head': None, 'synced_at': None, 'error': None, 'problems': {}}
+STATE = {'pages': {}, 'by_id': {}, 'head': None, 'synced_at': None, 'error': None, 'problems': {},
+         'shares': {}, 'share_problems': {}}
 LOCK = threading.Lock()
 
 
@@ -147,9 +156,44 @@ def build_index(head):
         }
         pages[slug] = info
         by_id[info['id']] = slug
-    STATE.update(pages=pages, by_id=by_id, head=head, problems=problems)
-    log(f'index: {len(pages)} pages at {head[:8]}' + (f', {len(problems)} with problems' if problems else ''))
+    shares, share_problems = build_share_index()
+    STATE.update(pages=pages, by_id=by_id, head=head, problems=problems, shares=shares, share_problems=share_problems)
+    log(f'index: {len(pages)} pages, {len(shares)} shares at {head[:8]}' +
+        (f', {len(problems) + len(share_problems)} with problems' if problems or share_problems else ''))
     threading.Thread(target=report_status, args=(head, pages, problems), daemon=True).start()
+
+
+def build_share_index():
+    """{token: info} for every share; expiry is checked per request, not here."""
+    shares, problems = {}, {}
+    root = os.path.join(CONTENT, 'shares')
+    for sid in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        folder = os.path.join(root, sid)
+        if not os.path.isdir(folder) or sid.startswith('.'):
+            continue
+        info, problem = pc.read_share(folder)
+        if not info:
+            problems[sid] = problem
+            continue
+        if info['token'] in shares:
+            problems[sid] = 'same token as another share; ignored'
+            continue
+        site = os.path.join(folder, 'site')
+        res = pc.check_page(site, share=True)
+        info.update(id=sid, sites=res.get('sites', []), libs=pc.lib_refs(site),
+                    title=info['title'] or res.get('title') or sid)
+        shares[info['token']] = info
+    return shares, problems
+
+
+def share_libs():
+    """Engine versions that live (unexpired) shares use."""
+    now = time.time()
+    out = set()
+    for s in list(STATE['shares'].values()):
+        if s['expires'] > now:
+            out |= s['libs']
+    return out
 
 
 def last_change(path):
@@ -317,8 +361,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/' or path == '/index.html':
             return self.send(200, home_page(), headers={'Cache-Control': 'no-store'})
         if path == '/api/health':
+            live = sum(1 for s in list(STATE['shares'].values()) if s['expires'] > time.time())
             return self.send(200, json.dumps({k: STATE[k] for k in ('head', 'synced_at', 'error')} |
-                                             {'pages': len(STATE['pages']), 'rules': pc.RULES_VERSION}), 'application/json')
+                                             {'pages': len(STATE['pages']), 'shares_live': live,
+                                              'share_problems': STATE['share_problems'],
+                                              'rules': pc.RULES_VERSION}), 'application/json')
         if path == '/api/pages':
             return self.send(200, json.dumps(sorted(STATE['pages'].values(), key=lambda p: p['slug']), indent=1),
                              'application/json', {'Cache-Control': 'no-store'})
@@ -344,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(204, b'')
         self.not_found()
 
-    def static(self, root, rel, page, immutable=False):
+    def static(self, root, rel, page, immutable=False, extra=None):
         rel = posixpath.normpath(urllib.parse.unquote(rel))
         if rel.endswith('/') or rel in ('/', '.'):
             rel = rel.rstrip('/') + '/index.html'
@@ -373,6 +420,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         if page is not None or full.endswith(('.html', '.htm', '.svg')):
             headers['Content-Security-Policy'] = pc.csp_for(page['sites'] if page else [], self.origin())
+        headers.update(extra or {})
         self.send(200, data, ctype, headers)
 
     def do_POST(self):
@@ -386,6 +434,58 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(401, '{"error":"bad signature"}', 'application/json')
         threading.Thread(target=sync, daemon=True).start()
         self.send(202, '{"ok":true}', 'application/json')
+
+
+SHARE_HEADERS = {
+    'Cache-Control': 'private, no-store',          # nothing kept by Cloudflare or browsers past expiry
+    'X-Robots-Tag': 'noindex, nofollow, noarchive',
+}
+
+
+def share_message(title, text):
+    return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title></head>'
+            f'<body style="font:16px/1.5 system-ui,sans-serif;max-width:32em;margin:15vh auto;padding:0 1.5em;color:#444">'
+            f'<h1 style="font-size:1.3em;color:#222">{esc(title)}</h1><p>{esc(text)}</p></body></html>')
+
+
+class ShareHandler(Handler):
+    """The public share host. Knows nothing about the portal: no home page, no API, no hook."""
+    server_version = 'Share/1'
+
+    def not_found(self, msg='Not found'):
+        self.send(404, share_message('Not found', 'There is nothing at this address.'),
+                  headers=SHARE_HEADERS)
+
+    def _get(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == '/robots.txt':
+            return self.send(200, 'User-agent: *\nDisallow: /\n', 'text/plain; charset=utf-8')
+        if path == '/favicon.ico':
+            return self.send(204, b'')
+        m = re.match(r'^/s/([^/]+)(/.*)?$', path)
+        if m:
+            token, rest = m.group(1), m.group(2)
+            share = STATE['shares'].get(token) if pc.SHARE_TOKEN_RE.fullmatch(token) else None
+            if not share:
+                return self.not_found()
+            if share['expires'] <= time.time():
+                return self.send(410, share_message('This link has expired',
+                                                    'Ask the person who sent it for a new one.'),
+                                 headers=SHARE_HEADERS)
+            if rest is None:
+                return self.send(301, '', headers={'Location': f'/s/{token}/', **SHARE_HEADERS})
+            return self.static(os.path.join(CONTENT, 'shares', share['id'], 'site'), rest, share,
+                               extra=SHARE_HEADERS)
+        clean = posixpath.normpath(urllib.parse.unquote(path))
+        m = re.match(r'^/lib/([a-z0-9][a-z0-9-]*)/([^/]+)(/.+)$', clean)
+        if m and (m.group(1), m.group(2)) in share_libs():
+            return self.static(os.path.join(CONTENT, 'lib'), '/' + m.group(1) + '/' + m.group(2) + m.group(3),
+                               None, extra={'Cache-Control': 'public, max-age=3600'})
+        self.not_found()
+
+    def do_POST(self):
+        self.not_found()
 
 
 class Server(ThreadingHTTPServer):
@@ -418,6 +518,10 @@ def main():
     log(f"portal starting on :{S['port']} for {S['repo'] or '(no repo)'} ({S['branch']}), polling every {S['poll']}s")
     threading.Thread(target=poller, daemon=True).start()
     srv = Server(('0.0.0.0', S['port']), Handler)
+    if S['share_port'] and S['share_port'] != S['port']:
+        share_srv = Server(('0.0.0.0', S['share_port']), ShareHandler)
+        threading.Thread(target=share_srv.serve_forever, daemon=True).start()
+        log(f"share links listening on :{S['share_port']} (only /s/<token>/ and the engines live shares use)")
     threading.Thread(target=self_test, daemon=True).start()
     log('listening; open http://<home-assistant-ip>:%d/' % S['port'])
     srv.serve_forever()

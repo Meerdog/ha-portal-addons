@@ -11,3 +11,10 @@
 
 ## 0.1.2
 - Logs every incoming connection and runs a self-test at start, to trace connection problems.
+
+## 0.2.0
+- Share links: a second listener (port 8098) serves `shares/` from the content repo at
+  `/s/<token>/`, without sign-in, until each share's end date. Expired links answer 410.
+  Serves only the engine versions live shares use, sends no-store and noindex headers, and
+  knows nothing else about the portal.
+- Shared rules version 2.

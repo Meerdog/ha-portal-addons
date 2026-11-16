@@ -15,14 +15,29 @@ portal:
     report-audience  Who may open it (enforced once the portal sits behind Cloudflare Access).
     report-author    Keeps the author's own access.
     report-sites     Outside sites the page may use: "images host, code host/path/, data host".
+
+A *share* is a page served without sign-in at a secret, expiring link on the share
+host (/s/<token>/). It lives in the content repo as:
+
+    shares/<id>/share.json   {"token", "expires" (UTC ISO), "title", "created"}
+    shares/<id>/site/        the page folder (index.html plus files)
+
+A share may use /lib/ engines (the share host serves only the versions live shares
+use) but not /data/, and report-audience does not apply to it.
 """
 import hashlib
 import html as _html
+import json
 import os
 import re
 import unicodedata
+from datetime import datetime, timezone
 
-RULES_VERSION = '1'          # bump in both copies (add-on and content repo tools/) when the rules change
+RULES_VERSION = '2'          # bump in both copies (add-on and content repo tools/) when the rules change
+
+SHARE_MAX_DAYS = 90
+SHARE_TOKEN_RE = re.compile(r'[A-Za-z0-9_-]{22,64}')
+LIB_REF_RE = re.compile(r'/lib/([a-z0-9][a-z0-9-]{0,40})/([A-Za-z0-9][\w.-]{0,30})/')
 
 MAX_PAGE_BYTES = 100 * 1024 * 1024          # whole page folder
 TEXT_EXT = {'.html', '.htm', '.js', '.mjs', '.css', '.json', '.svg', '.txt', '.md', '.xml', '.csv', '.geojson'}
@@ -154,8 +169,9 @@ def site_allows(sites, url, use):
     return False
 
 
-def scan_text(text, relpath, sites, is_html):
+def scan_text(text, relpath, sites, is_html, share=False):
     """Problems for outside loads and root-absolute paths in one text file."""
+    roots = ('/lib/',) if share else ('/lib/', '/data/')
     problems = []
     for i, pat in enumerate(LOAD_PATTERNS):
         if i in (0, 1, 2) and not is_html and not relpath.endswith('.svg'):
@@ -177,16 +193,18 @@ def scan_text(text, relpath, sites, is_html):
                         problems.append({'file': relpath, 'line': line, 'text': ref[:160],
                                          'reason': f'loads from outside ({use}); inline it, add it to the page, '
                                                    f'or declare it in report-sites'})
-                elif ref.startswith('/') and not ref.startswith(('/lib/', '/data/')):
+                elif ref.startswith('/') and not ref.startswith(roots):
                     problems.append({'file': relpath, 'line': line, 'text': ref[:160],
-                                     'reason': 'root path; use a relative path (or /lib/ for engines)'})
+                                     'reason': ('portal /data is not available to share links; put the data in the page'
+                                                if ref.startswith('/data/') else
+                                                'root path; use a relative path (or /lib/ for engines)')})
     return problems
 
 
 # ---------------------------------------------------------------- whole page
 
-def check_page(folder):
-    """Validate a page folder. Returns a dict:
+def check_page(folder, share=False):
+    """Validate a page folder (share=True: the rules for a public share link). Returns a dict:
        {ok, slug, title, meta:{...}, sites:[...], problems:[...], bytes, files}"""
     problems, files, total = [], [], 0
     index = os.path.join(folder, 'index.html')
@@ -226,6 +244,9 @@ def check_page(folder):
         for a in audience:
             if a.lower() != 'everyone' and '@' not in a and not re.fullmatch(r'[A-Za-z][\w .-]{0,40}', a):
                 bad('report-audience', f'"{a}" is not an email, a group name, or "everyone"')
+    if share and 'report-audience' in meta:
+        bad('report-audience', 'a share link is open to anyone who has it; remove report-audience, '
+                               'or publish to the portal instead')
     if 'report-author' in meta and '@' not in meta['report-author'][0]:
         bad('report-author', 'must be an email')
     sites = []
@@ -237,7 +258,7 @@ def check_page(folder):
         ext = os.path.splitext(rel)[1].lower()
         if ext in SCAN_EXT:
             text = open(os.path.join(folder, rel), encoding='utf-8', errors='replace').read()
-            problems += scan_text(text, rel, sites, ext in ('.html', '.htm'))
+            problems += scan_text(text, rel, sites, ext in ('.html', '.htm'), share)
     if total > MAX_PAGE_BYTES:
         problems.append({'file': '', 'line': 0, 'text': f'{total:,} bytes',
                          'reason': f'page is over the {MAX_PAGE_BYTES // 1048576} MB limit; move big data to /data or the database'})
@@ -253,6 +274,49 @@ def check_page(folder):
         'bytes': total,
         'files': sorted(files),
     }
+
+
+# ---------------------------------------------------------------- shares
+
+def parse_time(s):
+    """UTC ISO ('2026-11-23T18:20:00Z') -> epoch seconds, or None."""
+    try:
+        return datetime.strptime(s, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def iso_time(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def read_share(share_dir):
+    """(info, problem) for shares/<id>/. info = {token, expires (epoch), expires_iso, title, created}."""
+    try:
+        meta = json.load(open(os.path.join(share_dir, 'share.json'), encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        return None, f'share.json is missing or unreadable ({e.__class__.__name__})'
+    token, expires = meta.get('token', ''), parse_time(meta.get('expires'))
+    if not SHARE_TOKEN_RE.fullmatch(token or ''):
+        return None, 'share.json has no valid token'
+    if expires is None:
+        return None, 'share.json has no valid expires (UTC, like 2026-11-23T18:20:00Z)'
+    if not os.path.isfile(os.path.join(share_dir, 'site', 'index.html')):
+        return None, 'share has no site/index.html'
+    return {'token': token, 'expires': expires, 'expires_iso': meta['expires'],
+            'title': meta.get('title', ''), 'created': meta.get('created', '')}, None
+
+
+def lib_refs(folder):
+    """{(name, version)} of /lib/ engines that the text files in a folder refer to."""
+    found = set()
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for n in names:
+            if os.path.splitext(n)[1].lower() in SCAN_EXT:
+                text = open(os.path.join(root, n), encoding='utf-8', errors='replace').read()
+                found |= set(LIB_REF_RE.findall(text))
+    return found
 
 
 def csp_for(sites, self_origin):

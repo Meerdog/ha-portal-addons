@@ -26,6 +26,13 @@ Nothing on Home Assistant changes when you publish, update, unpublish or restore
 | `/lib/<name>/<version>/` | Shared engines and libraries |
 | `/api/health` | Sync state, for checking |
 
+On the separate share port (8098), and nothing else:
+
+| Address | What |
+|---|---|
+| `/s/<token>/` | A share link, until it expires; after that it says the link has expired |
+| `/lib/<name>/<version>/` | Only the engine versions a live share uses |
+
 ## Options
 
 - `github_repo` — the content repo, `owner/name`.
@@ -36,9 +43,31 @@ Nothing on Home Assistant changes when you publish, update, unpublish or restore
 - `public_url` — later, your outside address (for example `https://portal.example.com`), used in links.
 - `webhook_secret` — later, with a GitHub webhook to `<public_url>/hook`, pages go live instantly.
 
+## Share links
+
+Share links are for things you want to send to someone without them signing in. Each one
+has a long random link and an end date (7 days unless you ask for another, at most 90).
+They're served on their own port, so the public share address can never reach the portal.
+
+Setup (once), in the **Cloudflared** add-on's Configuration (⋮ → Edit in YAML), add a second host:
+
+```yaml
+additional_hosts:
+  - hostname: portal.tango.trading
+    service: http://c19af449-home-portal:8099
+  - hostname: share.tango.trading
+    service: http://c19af449-home-portal:8098
+```
+
+Restart Cloudflared. Do **not** add `share.tango.trading` to Cloudflare Access; if your Access
+application covers `*.tango.trading`, add a separate application for `share.tango.trading`
+with a **Bypass – Everyone** policy. Leave port 8098 empty under Network; the tunnel reaches it
+inside Home Assistant.
+
 ## Safety
 
 Every page is served with a security policy that runs it in a sealed-off origin and only
 lets it load from the portal and from outside sites it declares in `report-sites`.
 `report-audience` is enforced once the portal sits behind Cloudflare Access; on the home
-network alone, anyone on your Wi-Fi can open any page.
+network alone, anyone on your Wi-Fi can open any page. A share link is open to anyone
+who has the link until it expires or is revoked, and is never listed or indexed.
