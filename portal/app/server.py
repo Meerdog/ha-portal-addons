@@ -73,6 +73,7 @@ def load_settings():
         'data_dir': os.environ.get('PORTAL_DATA', '/data'),
         'port': int(os.environ.get('PORTAL_PORT', 8099)),
         'share_port': int(os.environ.get('PORTAL_SHARE_PORT', 8098)),
+        'idle_timeout': int(os.environ.get('PORTAL_IDLE_TIMEOUT', 120)),
     }
 
 
@@ -297,9 +298,14 @@ main{{max-width:1100px;margin:auto;padding:0 24px 40px}}h2{{font-size:.75rem;let
 class Handler(BaseHTTPRequestHandler):
     server_version = 'HomePortal/1'
     protocol_version = 'HTTP/1.1'
+    # Keep-alive connections that go quiet (the tunnel opens many and abandons some) are
+    # closed after this many seconds. Without it each one held a thread forever, until the
+    # add-on could start no more threads or processes. Longer than cloudflared's 90 s idle
+    # timeout, so the tunnel closes its idle connections first and never reuses a dead one.
+    timeout = S['idle_timeout']
 
     def log_message(self, fmt, *args):
-        if os.environ.get('PORTAL_QUIET'):
+        if os.environ.get('PORTAL_QUIET') or fmt.startswith('Request timed out'):
             return
         log(self.address_string(), fmt % args)
 
@@ -364,6 +370,7 @@ class Handler(BaseHTTPRequestHandler):
             live = sum(1 for s in list(STATE['shares'].values()) if s['expires'] > time.time())
             return self.send(200, json.dumps({k: STATE[k] for k in ('head', 'synced_at', 'error')} |
                                              {'pages': len(STATE['pages']), 'shares_live': live,
+                                              'threads': threading.active_count(),
                                               'share_problems': STATE['share_problems'],
                                               'rules': pc.RULES_VERSION}), 'application/json')
         if path == '/api/pages':

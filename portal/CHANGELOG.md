@@ -18,3 +18,10 @@
   Serves only the engine versions live shares use, sends no-store and noindex headers, and
   knows nothing else about the portal.
 - Shared rules version 2.
+
+## 0.2.1
+- Fixes the add-on slowly running out of threads (502 errors from the tunnel, then
+  "can't start new thread" and "Resource temporarily unavailable" sync errors): idle
+  keep-alive connections are now closed after 120 seconds instead of holding a thread forever.
+- Runs with an init process, so background processes git leaves behind are cleaned up.
+- `/api/health` reports the number of running threads.
